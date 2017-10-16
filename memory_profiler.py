@@ -22,9 +22,13 @@ from signal import SIGKILL
 
 # TODO: provide alternative when multiprocessing is not available
 try:
-    from multiprocessing import Process, Pipe
+    from billiard import Process, Pipe
 except ImportError:
-    from multiprocessing.dummy import Process, Pipe
+    try:
+        from multiprocessing import Process, Pipe
+    except ImportError:
+        from multiprocessing.dummy import Process, Pipe
+
 
 try:
     from IPython.core.magic import Magics, line_cell_magic, magics_class

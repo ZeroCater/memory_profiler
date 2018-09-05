@@ -1,5 +1,5 @@
-.. image:: https://travis-ci.org/fabianp/memory_profiler.svg?branch=master
-    :target: https://travis-ci.org/fabianp/memory_profiler
+.. image:: https://travis-ci.org/pythonprofilers/memory_profiler.svg?branch=master
+    :target: https://travis-ci.org/pythonprofilers/memory_profiler
 
 =================
  Memory Profiler
@@ -7,9 +7,8 @@
 
 This is a python module for monitoring memory consumption of a process
 as well as line-by-line analysis of memory consumption for python
-programs. It is a pure python module and has the `psutil
-<http://pypi.python.org/pypi/psutil>`_ module as optional (but highly
-recommended) dependencies.
+programs. It is a pure python module which depends on the `psutil
+<http://pypi.python.org/pypi/psutil>`_ module.
 
 
 ==============
@@ -18,6 +17,9 @@ recommended) dependencies.
 To install through easy_install or pip::
 
     $ easy_install -U memory_profiler # pip install -U memory_profiler
+
+The package is also available on `conda-forge
+<https://github.com/conda-forge/memory_profiler-feedstock>`_.
 
 To install from source, download the package, extract and type::
 
@@ -187,7 +189,7 @@ flag and plot as follows::
 This will create a plot using matplotlib similar to this:
 
 .. image:: https://cloud.githubusercontent.com/assets/745966/24075879/2e85b43a-0bfa-11e7-8dfe-654320dbd2ce.png
-    :target: https://github.com/fabianp/memory_profiler/pull/134
+    :target: https://github.com/pythonprofilers/memory_profiler/pull/134
     :height: 350px
 
 You can combine both the ``include_children`` and ``multiprocess`` flags to show
@@ -385,7 +387,7 @@ file ~/.ipython/ipy_user_conf.py to add the following lines::
       between runs.
 
     * Q: Does it work under windows ?
-    * A: Yes, but you will need the
+    * A: Yes, thanks to the
       `psutil <http://pypi.python.org/pypi/psutil>`_ module.
 
 
@@ -396,7 +398,7 @@ file ~/.ipython/ipy_user_conf.py to add the following lines::
 For support, please ask your question on `stack overflow
 <http://stackoverflow.com/>`_ and add the `*memory-profiling* tag <http://stackoverflow.com/questions/tagged/memory-profiling>`_.
 Send issues, proposals, etc. to `github's issue tracker
-<https://github.com/fabianp/memory_profiler/issues>`_ .
+<https://github.com/pythonprofilers/memory_profiler/issues>`_ .
 
 If you've got questions regarding development, you can email me
 directly at fabian@fseoane.net
@@ -409,7 +411,7 @@ directly at fabian@fseoane.net
 =============
 Latest sources are available from github:
 
-    https://github.com/fabianp/memory_profiler
+    https://github.com/pythonprofilers/memory_profiler
 
 ===============================
 Projects using memory_profiler
@@ -417,7 +419,7 @@ Projects using memory_profiler
 
 `Benchy <https://github.com/python-recsys/benchy>`_
 
-`IPython memory usage <https://github.com/ianozsvald/ipython_memory_usage_>`_
+`IPython memory usage <https://github.com/ianozsvald/ipython_memory_usage>`_
 
 `PySpeedIT <https://github.com/peter1000/PySpeedIT>`_ (uses a reduced version of memory_profiler)
 
@@ -448,6 +450,8 @@ cleanup.
 `Benjamin Bengfort <https://github.com/bbengfort>`_ added support for tracking the usage of individual child processes and plotting them.
 
 `Muhammad Haseeb Tariq <https://github.com/mhaseebtariq>`_ fixed issue #152, which made the whole interpreter hang on functions that launched an exception.
+
+`Juan Luis Cano <https://github.com/Juanlu001>`_ modernized the infrastructure and helped with various things.
 
 =========
  License

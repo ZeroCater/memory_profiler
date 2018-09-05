@@ -3,28 +3,64 @@
 # .. we'll use this to pass it to the child script ..
 _CLEAN_GLOBALS = globals().copy()
 
-__version__ = '0.47'
+__version__ = '0.54.0'
 
 _CMD_USAGE = "python -m memory_profiler script_file.py"
 
-import time
-import sys
+from functools import wraps
+import inspect
+import linecache
+import logging
 import os
 import pdb
-import warnings
-import linecache
-import inspect
 import subprocess
-import logging
+import sys
+import time
 import traceback
-from signal import SIGKILL
+import warnings
+import importlib
+import distutils
+from distutils.util import strtobool
+
+if sys.platform == "win32":
+    # any value except signal.CTRL_C_EVENT and signal.CTRL_BREAK_EVENT
+    # can be used to kill a process unconditionally in Windows
+    SIGKILL = -1
+else:
+    from signal import SIGKILL
+import psutil
 
 
 # TODO: provide alternative when multiprocessing is not available
-try:
-    from multiprocessing import Process, Pipe
-except ImportError:
-    from multiprocessing.dummy import Process, Pipe
+
+# import Process and Pipe from a multiprocessing library in the following order:
+#
+#   billiard - if and only if MEMPROF_PREFERS_BILLIARD envvar is set and true
+#   multiprocessing
+#   multiprocessing.dummy
+#
+MULTILIBS = (
+    ("billiard", (lambda: True  if "MEMPROF_PREFERS_BILLIARD" in os.environ and
+                                    strtobool(os.environ["MEMPROF_PREFERS_BILLIARD"])
+                                else False)),
+    ("multiprocessing", None,),
+    ("multiprocessing.dummy", None,)
+)
+for module_tuple in MULTILIBS:
+    multi_module_name, use_if_test = module_tuple
+    try:
+        multi_module = importlib.import_module(multi_module_name)
+    except ImportError:
+        if multi_module_name == "multiprocessing.dummy":
+            raise
+        continue
+    if use_if_test is None or use_if_test():
+        try:
+            Process = multi_module.Process
+            Pipe = multi_module.Pipe
+            break
+        except AttributeError:
+            continue
 
 try:
     from IPython.core.magic import Magics, line_cell_magic, magics_class
@@ -40,6 +76,7 @@ _TWO_20 = float(2 ** 20)
 
 if PY2:
     import __builtin__ as builtins
+    from future_builtins import filter
 else:
     import builtins
 
@@ -48,13 +85,6 @@ else:
         return str(x)
 
 # .. get available packages ..
-try:
-    import psutil
-
-    has_psutil = True
-except ImportError:
-    has_psutil = False
-
 try:
     import tracemalloc
 
@@ -92,12 +122,6 @@ def _get_child_memory(process, meminfo_attr=None):
     """
     Returns a generator that yields memory for all child processes.
     """
-    if not has_psutil:
-        raise NotImplementedError((
-            "The psutil module is required to monitor the "
-            "memory usage of child processes."
-        ))
-
     # Convert a pid to a process
     if isinstance(process, int):
         if process == -1: process = os.getpid()
@@ -115,7 +139,7 @@ def _get_child_memory(process, meminfo_attr=None):
     try:
         for child in getattr(process, children_attr)(recursive=True):
             yield getattr(child, meminfo_attr)()[0] / _TWO_20
-    except psutil.NoSuchProcess:
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
         # https://github.com/fabianp/memory_profiler/issues/71
         yield 0.0
 
@@ -344,10 +368,9 @@ def memory_usage(proc=-1, interval=.1, timeout=None, timestamps=False,
                 if retval:
                     ret = ret, returned
             except Exception:
-                if has_psutil:
-                    parent = psutil.Process(os.getpid())
-                    for child in parent.children(recursive=True):
-                        os.kill(child.pid, SIGKILL)
+                parent = psutil.Process(os.getpid())
+                for child in parent.children(recursive=True):
+                    os.kill(child.pid, SIGKILL)
                 p.join(0)
                 raise
 
@@ -413,13 +436,13 @@ def memory_usage(proc=-1, interval=.1, timeout=None, timestamps=False,
 
                     # Write children to the stream file
                     if multiprocess:
-                        for idx, chldmem in enumerate(_get_child_memory(proc.pid)):
+                        for idx, chldmem in enumerate(_get_child_memory(proc)):
                             stream.write("CHLD {0} {1:.6f} {2:.4f}\n".format(idx, chldmem, time.time()))
                 else:
                     # Create a nested list with the child memory
                     if multiprocess:
                         mem_usage = [mem_usage]
-                        for chldmem in _get_child_memory(proc.pid):
+                        for chldmem in _get_child_memory(proc):
                             mem_usage.append(chldmem)
 
                     # Append the memory usage to the return value
@@ -593,12 +616,16 @@ class CodeMap(dict):
         for subcode in filter(inspect.iscode, code.co_consts):
             self.add(subcode, toplevel_code=toplevel_code)
 
-    def trace(self, code, lineno):
+    def trace(self, code, lineno, prev_lineno):
         memory = _get_memory(-1, self.backend, include_children=self.include_children,
                              filename=code.co_filename)
-        # if there is already a measurement for that line get the max
-        previous_memory = self[code].get(lineno, 0)
-        self[code][lineno] = max(memory, previous_memory)
+        prev_value = self[code].get(lineno, None)
+        previous_memory = prev_value[1] if prev_value else 0
+        previous_inc = prev_value[0] if prev_value else 0
+
+        prev_line_value = self[code].get(prev_lineno, None) if prev_lineno else None
+        prev_line_memory = prev_line_value[1] if prev_line_value else 0
+        self[code][lineno] = (max(previous_inc, memory-prev_line_memory), max(memory, previous_memory))
 
     def items(self):
         """Iterate on the toplevel code blocks."""
@@ -622,6 +649,7 @@ class LineProfiler(object):
         self.max_mem = kw.get('max_mem', None)
         self.prevlines = []
         self.backend = choose_backend(kw.get('backend', None))
+        self.prev_lineno = None
 
     def __call__(self, func=None, precision=1):
         if func is not None:
@@ -696,10 +724,15 @@ class LineProfiler(object):
                 # "call" event just saves the lineno but not the memory
                 self.prevlines.append(frame.f_lineno)
             elif event == 'line':
-                self.code_map.trace(frame.f_code, self.prevlines[-1])
+                # trace needs current line and previous line
+                self.code_map.trace(frame.f_code, self.prevlines[-1], self.prev_lineno)
+                # saving previous line
+                self.prev_lineno = self.prevlines[-1]
                 self.prevlines[-1] = frame.f_lineno
             elif event == 'return':
-                self.code_map.trace(frame.f_code, self.prevlines.pop())
+                lineno = self.prevlines.pop()
+                self.code_map.trace(frame.f_code, lineno, self.prev_lineno)
+                self.prev_lineno = lineno
 
         if self._original_trace_function is not None:
             self._original_trace_function(frame, event, arg)
@@ -760,13 +793,13 @@ def show_results(prof, stream=None, precision=1):
         stream.write(u'=' * len(header) + '\n')
 
         all_lines = linecache.getlines(filename)
-        mem_old = None
+
         float_format = u'{0}.{1}f'.format(precision + 4, precision)
         template_mem = u'{0:' + float_format + '} MiB'
         for (lineno, mem) in lines:
             if mem:
-                inc = (mem - mem_old) if mem_old else 0
-                mem_old = mem
+                inc = mem[0]
+                mem = mem[1]
                 mem = template_mem.format(mem)
                 inc = template_mem.format(inc)
             else:
@@ -1063,6 +1096,7 @@ def profile(func=None, stream=None, precision=1, backend='psutil'):
         if not tracemalloc.is_tracing():
             tracemalloc.start()
     if func is not None:
+        @wraps(func)
         def wrapper(*args, **kwargs):
             prof = LineProfiler(backend=backend)
             val = prof(func)(*args, **kwargs)
@@ -1086,10 +1120,9 @@ def choose_backend(new_backend=None):
 
     _backend = 'no_backend'
     all_backends = [
-        ('psutil', has_psutil),
+        ('psutil', True),
         ('posix', os.name == 'posix'),
         ('tracemalloc', has_tracemalloc),
-        ('no_backend', True)
     ]
     backends_indices = dict((b[0], i) for i, b in enumerate(all_backends))
 
@@ -1100,10 +1133,6 @@ def choose_backend(new_backend=None):
         if is_available:
             _backend = n_backend
             break
-    if _backend == 'no_backend':
-        raise NotImplementedError(
-            'Tracemalloc or psutil module is required for non-unix '
-            'platforms')
     if _backend != new_backend and new_backend is not None:
         warnings.warn('{0} can not be used, {1} used instead'.format(
             new_backend, _backend))
@@ -1114,23 +1143,35 @@ def choose_backend(new_backend=None):
 # globally defined (global variables is not enough
 # for all cases, e.g. a script that imports another
 # script where @profile is used)
-if PY2:
-    def exec_with_profiler(filename, profiler, backend):
-        builtins.__dict__['profile'] = profiler
-        ns = dict(_CLEAN_GLOBALS, profile=profiler)
-        choose_backend(backend)
-        execfile(filename, ns, ns)
-else:
-    def exec_with_profiler(filename, profiler, backend):
-        _backend = choose_backend(backend)
+def exec_with_profiler(filename, profiler, backend, passed_args=[]):
+    from runpy import run_module
+    builtins.__dict__['profile'] = profiler
+    ns = dict(_CLEAN_GLOBALS, profile=profiler)
+    _backend = choose_backend(backend)
+    sys.argv = [filename] + passed_args
+    try:
         if _backend == 'tracemalloc' and has_tracemalloc:
             tracemalloc.start()
-        builtins.__dict__['profile'] = profiler
-        # shadow the profile decorator defined above
-        ns = dict(_CLEAN_GLOBALS, profile=profiler)
+        with open(filename) as f:
+            exec(compile(f.read(), filename, 'exec'), ns, ns)
+    finally:
+        if has_tracemalloc and tracemalloc.is_tracing():
+            tracemalloc.stop()
+
+
+def run_module_with_profiler(module, profiler, backend, passed_args=[]):
+    from runpy import run_module
+    builtins.__dict__['profile'] = profiler
+    ns = dict(_CLEAN_GLOBALS, profile=profiler)
+    _backend = choose_backend(backend)
+    sys.argv = [module] + passed_args
+    if PY2:
+        run_module(module, run_name="__main__", init_globals=ns)
+    else:
+        if _backend == 'tracemalloc' and has_tracemalloc:
+            tracemalloc.start()
         try:
-            with open(filename) as f:
-                exec(compile(f.read(), filename, 'exec'), ns, ns)
+            run_module(module, run_name="__main__", init_globals=ns)
         finally:
             if has_tracemalloc and tracemalloc.is_tracing():
                 tracemalloc.stop()
@@ -1169,55 +1210,58 @@ class LogFile(object):
 
 
 if __name__ == '__main__':
-    from optparse import OptionParser
+    from argparse import ArgumentParser, REMAINDER
 
-    parser = OptionParser(usage=_CMD_USAGE, version=__version__)
-    parser.disable_interspersed_args()
-    parser.add_option(
+    parser = ArgumentParser(usage=_CMD_USAGE)
+    parser.add_argument('--version', action='version', version=__version__)
+    parser.add_argument(
         '--pdb-mmem', dest='max_mem', metavar='MAXMEM',
-        type='float', action='store',
+        type=float, action='store',
         help='step into the debugger when memory exceeds MAXMEM')
-    parser.add_option(
-        '--precision', dest='precision', type='int',
+    parser.add_argument(
+        '--precision', dest='precision', type=int,
         action='store', default=3,
         help='precision of memory output in number of significant digits')
-    parser.add_option('-o', dest='out_filename', type='str',
-                      action='store', default=None,
-                      help='path to a file where results will be written')
-    parser.add_option('--timestamp', dest='timestamp', default=False,
-                      action='store_true',
-                      help='''print timestamp instead of memory measurement for
-                      decorated functions''')
-    parser.add_option('--backend', dest='backend', type='choice',
-                      action='store',
-                      choices=['tracemalloc', 'psutil', 'posix'],
-                      default='psutil',
-                      help='backend using for getting memory info '
-                           '(one of the {tracemalloc, psutil, posix})')
+    parser.add_argument('-o', dest='out_filename', type=str,
+        action='store', default=None,
+        help='path to a file where results will be written')
+    parser.add_argument('--timestamp', dest='timestamp', default=False,
+        action='store_true',
+        help='''print timestamp instead of memory measurement for
+        decorated functions''')
+    parser.add_argument('--backend', dest='backend', type=str, action='store',
+        choices=['tracemalloc', 'psutil', 'posix'], default='psutil',
+        help='backend using for getting memory info '
+             '(one of the {tracemalloc, psutil, posix})')
+    parser.add_argument("program", nargs=REMAINDER,
+        help='python script or module followed by command line arguements to run')
+    args = parser.parse_args()
 
-    if not sys.argv[1:]:
-        parser.print_help()
-        sys.exit(2)
+    if len(args.program) == 0:
+        print("A program to run must be provided. Use -h for help")
+        sys.exit(1)
 
-    (options, args) = parser.parse_args()
-    sys.argv[:] = args  # Remove every memory_profiler arguments
-
-    script_filename = _find_script(args[0])
-    _backend = choose_backend(options.backend)
-    if options.timestamp:
+    target = args.program[0]
+    script_args = args.program[1:]
+    _backend = choose_backend(args.backend)
+    if args.timestamp:
         prof = TimeStamper(_backend)
     else:
-        prof = LineProfiler(max_mem=options.max_mem, backend=_backend)
+        prof = LineProfiler(max_mem=args.max_mem, backend=_backend)
 
     try:
-        exec_with_profiler(script_filename, prof, options.backend)
+        if args.program[0].endswith('.py'):
+            script_filename = _find_script(args.program[0])
+            exec_with_profiler(script_filename, prof, args.backend, script_args)
+        else:
+            run_module_with_profiler(target, prof, args.backend, script_args)
     finally:
-        if options.out_filename is not None:
-            out_file = open(options.out_filename, "a")
+        if args.out_filename is not None:
+            out_file = open(args.out_filename, "a")
         else:
             out_file = sys.stdout
 
-        if options.timestamp:
+        if args.timestamp:
             prof.show_results(stream=out_file)
         else:
-            show_results(prof, precision=options.precision, stream=out_file)
+            show_results(prof, precision=args.precision, stream=out_file)
